@@ -312,6 +312,80 @@ def streaming_against_mock_server():
         srv.shutdown()
 
 
+class RecGemini(BaseHTTPRequestHandler):
+    """Gemini mock that records (model, thinkingConfig) for every request."""
+    log: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        ms = [("gemini-3.6-flash", ["generateContent"]), ("gemini-3.1-flash-lite", ["generateContent"]),
+              ("gemini-2.5-flash", ["generateContent"]), ("gemini-3.6-flash-tts", ["generateContent"])]
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({"models": [{"name": f"models/{n}", "supportedGenerationMethods": m} for n, m in ms]}).encode())
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        name = self.path.split("/")[-1].split(":")[0]
+        cfg = body.get("generationConfig", {})
+        RecGemini.log.append((name, cfg.get("thinkingConfig")))
+        if name == "gemini-3.6-flash":
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"retired"}}')
+            return
+        if name == "gemini-2.5-flash" and "thinkingConfig" in cfg:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"Thinking config unsupported"}}')
+            return
+        self.send_response(200)
+        self.end_headers()
+        for piece in ("Hel", "lo"):
+            self.wfile.write(f'data: {json.dumps({"candidates": [{"content": {"parts": [{"text": piece}]}}]})}\n\n'.encode())
+
+
+def _gem_server():
+    srv = HTTPServer(("127.0.0.1", 0), RecGemini)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    llm._models_cache.clear()
+    llm._good.clear()
+    llm._no_think.clear()
+    RecGemini.log = []
+    return srv, f"http://127.0.0.1:{srv.server_port}"
+
+
+@test
+def gemini_speed_order_thinking_off_and_memory():
+    srv, base = _gem_server()
+    try:
+        assert llm.gemini_candidates("k", base, "Fast")[:2] == ("gemini-3.1-flash-lite", "gemini-3.6-flash")
+        assert llm.gemini_candidates("k", base, "Accurate")[0] == "gemini-3.6-flash"
+        cfg = llm.LLM("Gemini (free key)", "auto", "k", base, "Accurate")
+        info = {}
+        out = "".join(llm.stream_chat(cfg, "s", [{"role": "user", "content": "hi"}], info))
+        assert out == "Hello" and info["model"] == "gemini-2.5-flash"                   # 3.6 retired, 2.5 next
+        assert RecGemini.log[0] == ("gemini-3.6-flash", {"thinkingLevel": "minimal"})   # thinking is off
+        RecGemini.log.clear()
+        "".join(llm.stream_chat(cfg, "s", [{"role": "user", "content": "again"}]))
+        assert RecGemini.log == [("gemini-2.5-flash", None)]   # winner remembered, retired model and rejected setting skipped
+    finally:
+        srv.shutdown()
+
+
+@test
+def gemini_retries_without_thinking_when_rejected():
+    srv, base = _gem_server()
+    try:
+        cfg = llm.LLM("Gemini (free key)", "gemini-2.5-flash", "k", base)
+        assert "".join(llm.stream_chat(cfg, "s", [{"role": "user", "content": "hi"}])) == "Hello"
+        assert RecGemini.log == [("gemini-2.5-flash", {"thinkingBudget": 0}), ("gemini-2.5-flash", None)]
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     failed = 0
     for fn in TESTS:

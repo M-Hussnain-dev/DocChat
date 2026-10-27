@@ -12,6 +12,9 @@ Chat with your own documents. Add PDFs, Word files, slides, spreadsheets, CSV, H
 - Safety: prompt-injection guard, private-network URLs blocked, nothing stored on the server
 - Automated tests: `python test_system.py`
 
+## Speed
+Gemini is tuned for speed: thinking is switched off, the upload is shrunk before sending, one connection is reused, the last working model is remembered, and a retired or rate-limited model is skipped automatically. Choose **Fast** (Flash-Lite models, default) or **Accurate** (full Flash) in the sidebar. Identical questions are answered instantly from a cache, and the page shows the time to first words for every answer.
+
 ## Gemini key (free)
 Never put the key inside the code or upload it to GitHub. Choose one:
 - On your PC: `python setup.py --key` (saves it to `.streamlit/secrets.toml`; keep that file on your computer only)

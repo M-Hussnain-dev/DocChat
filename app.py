@@ -112,6 +112,20 @@ def load_demo():
     ingest(readers.Document(rag.DEMO_NAME, "demo", [("", rag.DEMO_TEXT)]), "demo")
 
 
+@st.cache_resource(show_spinner=False)
+def warm_gemini(key: str, speed: str) -> bool:
+    """Look up the best Gemini model in the background so the first question does not wait for it."""
+    import threading
+
+    def work():
+        try:
+            llm.gemini_candidates(key, llm.GEMINI_BASE, speed)
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
 @st.cache_resource(show_spinner="Loading the semantic search model (first time only)…")
 def load_embedder(name: str):
     return ix.Embedder(name)
@@ -151,7 +165,7 @@ def sidebar() -> dict:
         st.markdown("### Answers")
         qopts = ["Keyword (fastest)"] + (list(ix.EMBED_MODELS) if ix.embeddings_available() else [])
         quality = st.selectbox("Search quality", qopts, help="Semantic search finds passages by meaning, not only by exact words.")
-        top_k = st.slider("Passages used per answer", 3, 12, 6)
+        top_k = st.slider("Passages used per answer", 3, 12, 5, help="Fewer passages means faster answers.")
         style = st.selectbox("Answer style", list(rag.STYLES))
         reply_lang = st.selectbox("Reply language", rag.REPLY_LANGS)
         custom = st.text_area("Extra instructions (optional)", placeholder="e.g. Answer like a friendly teaching assistant.", height=70)
@@ -160,12 +174,16 @@ def sidebar() -> dict:
             default = 1 if secret("GEMINI_API_KEY") else 2 if secret("LLM_API_KEY") else 3 if ollama else 0
             provider = st.selectbox("Answer engine", llm.PROVIDERS, index=default)
             key = model = base = ""
+            speed = "Fast"
             if provider.startswith("Gemini"):
                 key = st.text_input("Free Gemini API key", value=secret("GEMINI_API_KEY"), type="password",
                                     help="Free at aistudio.google.com/apikey")
                 model = st.text_input("Model", "auto", help="'auto' picks the newest free Flash model your key can use.")
+                speed = st.selectbox("Speed", llm.GEMINI_SPEEDS, help="Fast uses the lighter Flash-Lite models, usually 2 to 3 "
+                                     "times quicker. Accurate uses the full Flash model for harder questions.")
                 if key:
                     st.success("Gemini key loaded")
+                    warm_gemini(key, speed)
             elif provider.startswith("OpenAI"):
                 preset = st.selectbox("Provider", list(llm.PRESETS))
                 b0, m0 = llm.PRESETS[preset]
@@ -187,7 +205,7 @@ def sidebar() -> dict:
             embedder = load_embedder(ix.EMBED_MODELS[quality])
         except Exception as e:
             st.sidebar.warning(f"Semantic search is unavailable ({type(e).__name__}); using keyword search.")
-    return dict(llm=llm.LLM(provider, model, key, base), top_k=top_k, style=style, reply_lang=reply_lang, custom=custom,
+    return dict(llm=llm.LLM(provider, model, key, base, speed), top_k=top_k, style=style, reply_lang=reply_lang, custom=custom,
                 only=only or None, embedder=embedder, quality=quality)
 
 
@@ -222,7 +240,7 @@ def render_message(i: int, m: dict):
             render_sources(m)
             c1, c2 = st.columns([1, 4])
             c1.feedback("thumbs", key=f"fb_{i}")
-            c2.caption(f"{m['engine']} · found passages in {m['retrieval']:.2f}s · answered in {m['latency']:.1f}s")
+            c2.caption(f"{m['engine']} · passages found in {m['retrieval']:.2f}s · first words after {m.get('ttft', m['retrieval']):.1f}s · done in {m['latency']:.1f}s")
 
 
 def answer_turn(question: str, S: dict, task: str | None = None):
@@ -238,6 +256,22 @@ def answer_turn(question: str, S: dict, task: str | None = None):
     t_ret = time.time() - t0
     cfg = S["llm"]
     engine = f"{cfg.provider.split(' (')[0]} {cfg.model}".strip() if cfg.enabled else "Extractive"
+    info: dict = {}
+    ttft = None
+
+    # identical question + same documents + same settings: reuse the earlier answer instantly
+    cache = st.session_state.setdefault("acache", {})
+    ck = hashlib.md5(json.dumps([question, task, cfg.provider, cfg.model, cfg.speed, S["style"], S["reply_lang"], S["custom"],
+                                 S["top_k"], S["quality"], sorted(idx().docs().items()), sorted(S["only"] or [])]).encode()).hexdigest()
+    cached = None if st.session_state.pop("nocache", False) else cache.get(ck)
+
+    def timed(gen):
+        nonlocal ttft
+        for piece in gen:
+            if ttft is None:
+                ttft = time.time() - t0
+            yield piece
+
     with st.chat_message("assistant"):
         if not hits:
             text = rag.NOT_FOUND
@@ -246,12 +280,19 @@ def answer_turn(question: str, S: dict, task: str | None = None):
             text = "This action needs an AI model. Choose one under **AI model** in the sidebar."
             hits = []
             st.markdown(text)
+        elif cached and cfg.enabled:
+            text, engine, ttft = cached[0], f"{cached[1]} (cached)", 0.0
+            st.markdown(text)
         else:
             fallback = lambda: rag.extractive_answer("" if task else question, hits, 8 if task else 4)
             if cfg.enabled:
                 msgs = rag.build_messages(rag.QUICK[task] if task else question, hits, history)
+                system = rag.system_prompt(S["style"], S["custom"], S["reply_lang"])
                 try:
-                    text = st.write_stream(llm.stream_chat(cfg, rag.system_prompt(S["style"], S["custom"], S["reply_lang"]), msgs))
+                    text = st.write_stream(timed(llm.stream_chat(cfg, system, msgs, info)))
+                    if cfg.provider.startswith("Gemini") and info.get("model"):
+                        engine = f"Gemini {info['model']}"
+                    cache[ck] = (text, engine)
                 except llm.LLMError as e:
                     st.error(f"The AI model could not answer: {e}")
                     text, engine = fallback(), "Extractive (fallback)"
@@ -259,9 +300,11 @@ def answer_turn(question: str, S: dict, task: str | None = None):
             else:
                 text = fallback()
                 st.markdown(text)
+    now = time.time() - t0
     st.session_state.messages.append({"role": "assistant", "content": text, "query": "" if task else question,
                                       "hits": [hit_dict(i, h) for i, h in enumerate(hits, 1)], "engine": engine,
-                                      "retrieval": t_ret, "latency": time.time() - t0, "task": bool(task)})
+                                      "retrieval": t_ret, "ttft": ttft if ttft is not None else t_ret, "latency": now,
+                                      "task": bool(task)})
     st.rerun()
 
 
@@ -286,6 +329,17 @@ def page_chat(S: dict):
                 st.session_state.pending = (name, f"{name} my documents" if name == "Summarize" else name)
         if st.session_state.messages:
             cols[-1].download_button("Save chat", chat_markdown(), "docchat-conversation.md", "text/markdown")
+            b1, b2, _ = st.columns([1, 1, 4])
+            if b1.button("Clear chat"):
+                st.session_state.messages = []
+                st.rerun()
+            last_q = next((i for i in range(len(st.session_state.messages) - 1, -1, -1)
+                           if st.session_state.messages[i]["role"] == "user" and not st.session_state.messages[i].get("task")), None)
+            if last_q is not None and b2.button("Regenerate", help="Ask the last question again, ignoring the saved answer"):
+                question = st.session_state.messages[last_q]["content"]
+                st.session_state.messages = st.session_state.messages[:last_q]
+                st.session_state.pending = (None, question)
+                st.session_state.nocache = True
     if rag.DEMO_NAME in idx().docs() and not st.session_state.messages:
         st.caption("Try: " + "  ·  ".join(f"*{q}*" for q in rag.DEMO_QUESTIONS))
     for i, m in enumerate(st.session_state.messages):
@@ -331,12 +385,13 @@ def page_insights():
     votes = [st.session_state.get(f"fb_{i}") for i, m in enumerate(msgs) if m["role"] == "assistant"]
     votes = [v for v in votes if v is not None]
     nf = sum(1 for m in ans if rag.NOT_FOUND in m["content"])
-    c = st.columns(5)
+    c = st.columns(6)
     c[0].metric("Questions", len(ans))
-    c[1].metric("Avg answer time", f"{sum(m['latency'] for m in ans) / len(ans):.1f}s")
-    c[2].metric("Avg retrieval time", f"{sum(m['retrieval'] for m in ans) / len(ans):.2f}s")
-    c[3].metric("Not found in docs", f"{nf}/{len(ans)}")
-    c[4].metric("Helpful rate", f"{100 * sum(votes) / len(votes):.0f}%" if votes else "no votes yet")
+    c[1].metric("Avg first words", f"{sum(m.get('ttft', m['retrieval']) for m in ans) / len(ans):.1f}s")
+    c[2].metric("Avg full answer", f"{sum(m['latency'] for m in ans) / len(ans):.1f}s")
+    c[3].metric("Avg retrieval", f"{sum(m['retrieval'] for m in ans) / len(ans):.2f}s")
+    c[4].metric("Not found in docs", f"{nf}/{len(ans)}")
+    c[5].metric("Helpful rate", f"{100 * sum(votes) / len(votes):.0f}%" if votes else "no votes yet")
     used = pd.Series([h["doc"] for m in ans for h in m["hits"] if h["n"] in rag.cited_numbers(m["content"])]).value_counts()
     if len(used):
         st.markdown("##### Most cited documents")

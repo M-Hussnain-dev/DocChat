@@ -1,4 +1,6 @@
-"""Streaming chat clients: Gemini (free key), any OpenAI-compatible API (Groq, OpenRouter, ...), and local Ollama."""
+"""Streaming chat clients: Gemini (free key), any OpenAI-compatible API (Groq, OpenRouter, ...), and local Ollama.
+Gemini is tuned for speed: thinking is switched off, one connection is reused, the last working model is tried first,
+and models are discovered from your key with automatic fallback when one is retired or rate-limited."""
 from __future__ import annotations
 
 import json
@@ -16,11 +18,15 @@ PRESETS = {  # model names change over time: edit them in the sidebar if a provi
     "Custom": ("", ""),
 }
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
-
-
-GEMINI_FALLBACK = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash")
+GEMINI_SPEEDS = ["Fast", "Accurate"]
+GEMINI_FALLBACK = {"Fast": ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"),
+                   "Accurate": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash")}
 GEMINI_SKIP = ("tts", "image", "live", "audio", "embedding", "robotics", "computer", "native", "learnlm", "gemma")
-_models_cache: dict[str, tuple[float, tuple]] = {}
+RETRY_CODES = (404, 429, 500, 503)
+_client = httpx.Client(timeout=httpx.Timeout(120, connect=10), limits=httpx.Limits(max_keepalive_connections=8))
+_models_cache: dict[str, tuple[float, list]] = {}
+_good: dict[tuple, str] = {}
+_no_think: set[str] = set()   # models that rejected the thinking setting: do not ask again
 
 
 class LLMError(Exception):
@@ -35,6 +41,7 @@ class LLM:
     model: str = ""
     api_key: str = ""
     base_url: str = ""
+    speed: str = "Fast"
 
     @property
     def enabled(self) -> bool:
@@ -53,38 +60,51 @@ def _error(code: int, body: str) -> str:
     return f"{code}: {str(msg)[:220]} {hint}".strip()
 
 
-def gemini_candidates(key: str, base: str = GEMINI_BASE) -> tuple[str, ...]:
-    """Flash models this key can use (model names change often): stable first, full before lite, newest first."""
+def thinking_config(name: str) -> dict | None:
+    """Ask Gemini not to 'think' first: much faster, and plenty for answers grounded in your documents."""
+    if "2.5" in name:
+        return {"thinkingBudget": 0}
+    if name.startswith("gemini-3"):
+        return {"thinkingLevel": "low" if "pro" in name else "minimal"}
+    return None
+
+
+def gemini_candidates(key: str, base: str = GEMINI_BASE, speed: str = "Fast") -> tuple[str, ...]:
+    """Models to try, best first. Fast prefers Flash-Lite, Accurate the full Flash. Stable before preview."""
+    names: list[str] = []
     hit = _models_cache.get(key)
     if hit and time.time() - hit[0] < 3600:
-        return hit[1]
-    try:
-        r = httpx.get(f"{base.rstrip('/')}/v1beta/models", params={"pageSize": 200}, headers={"x-goog-api-key": key}, timeout=15)
-    except httpx.HTTPError:
-        return GEMINI_FALLBACK
-    if r.status_code in (400, 401, 403):
-        raise LLMError(_error(r.status_code, r.text), r.status_code)
-    if r.status_code != 200:
-        return GEMINI_FALLBACK
-    names = []
-    for m in r.json().get("models", []):
-        n = m.get("name", "").removeprefix("models/")
-        if "generateContent" in m.get("supportedGenerationMethods", []) and n.startswith("gemini") and "flash" in n \
-                and not any(x in n for x in GEMINI_SKIP):
-            names.append(n)
+        names = hit[1]
+    else:
+        try:
+            r = _client.get(f"{base.rstrip('/')}/v1beta/models", params={"pageSize": 200}, headers={"x-goog-api-key": key}, timeout=15)
+            if r.status_code in (400, 401, 403):
+                raise LLMError(_error(r.status_code, r.text), r.status_code)
+            if r.status_code == 200:
+                for m in r.json().get("models", []):
+                    n = m.get("name", "").removeprefix("models/")
+                    if "generateContent" in m.get("supportedGenerationMethods", []) and n.startswith("gemini") and "flash" in n \
+                            and not any(x in n for x in GEMINI_SKIP):
+                        names.append(n)
+                _models_cache[key] = (time.time(), names)
+        except httpx.HTTPError:
+            pass
 
     def rank(n: str):
         v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
-        return (bool(re.search(r"preview|exp", n)), "lite" in n, -(float(v.group(1)) if v else 0.0), n)
+        return (bool(re.search(r"preview|exp", n)), ("lite" in n) == (speed == "Accurate"), -(float(v.group(1)) if v else 0.0), n)
 
-    out = tuple(sorted(set(names), key=rank)[:5]) or GEMINI_FALLBACK
-    _models_cache[key] = (time.time(), out)
-    return out
+    out = sorted(set(names), key=rank)[:5] or list(GEMINI_FALLBACK.get(speed, GEMINI_FALLBACK["Fast"]))
+    good = _good.get((key, speed))
+    if good in out:  # remember what worked last time: no wasted attempts
+        out.remove(good)
+        out.insert(0, good)
+    return tuple(out)
 
 
 def _lines(url: str, headers: dict, payload: dict) -> Iterator[str]:
     try:
-        with httpx.stream("POST", url, headers=headers, json=payload, timeout=httpx.Timeout(120, connect=10)) as r:
+        with _client.stream("POST", url, headers=headers, json=payload) as r:
             if r.status_code != 200:
                 raise LLMError(_error(r.status_code, r.read().decode("utf-8", "replace")), r.status_code)
             yield from r.iter_lines()
@@ -129,35 +149,53 @@ def parse_ollama(line: str) -> str:
     return (j.get("message") or {}).get("content", "")
 
 
-def stream_chat(cfg: LLM, system: str, messages: list[dict]) -> Iterator[str]:
-    """messages: [{'role': 'user'|'assistant', 'content': str}]. Yields text pieces as they arrive."""
-    if cfg.provider.startswith("Gemini"):
-        if not cfg.api_key:
-            raise LLMError("Add your free Gemini API key in the sidebar.")
-        base = (cfg.base_url or GEMINI_BASE).rstrip("/")
-        names = [cfg.model] if cfg.model and cfg.model != "auto" else list(gemini_candidates(cfg.api_key, base))
-        payload = {"systemInstruction": {"parts": [{"text": system}]},
-                   "contents": [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]} for m in messages],
-                   "generationConfig": {"temperature": 0.2}}
-        last: LLMError = LLMError("No Gemini model could answer.")
-        for name in names:  # retired or rate-limited model: try the next one before any text was sent
+def _gemini_stream(cfg: LLM, system: str, messages: list[dict], info: dict | None) -> Iterator[str]:
+    if not cfg.api_key:
+        raise LLMError("Add your free Gemini API key in the sidebar.")
+    base = (cfg.base_url or GEMINI_BASE).rstrip("/")
+    names = [cfg.model] if cfg.model and cfg.model != "auto" else list(gemini_candidates(cfg.api_key, base, cfg.speed))
+    contents = [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]} for m in messages]
+    last: LLMError = LLMError("No Gemini model could answer.")
+    for name in names:  # retired or rate-limited model: try the next one before any text was sent
+        for thinking in ((True, False) if thinking_config(name) and name not in _no_think else (False,)):
+            cfg_json: dict = {"temperature": 0.2}
+            if thinking:
+                cfg_json["thinkingConfig"] = thinking_config(name)
+            payload = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": cfg_json}
             started = False
             try:
-                for line in _lines(f"{base}/v1beta/models/{name}:streamGenerateContent?alt=sse",
-                                   {"x-goog-api-key": cfg.api_key}, payload):
+                for line in _lines(f"{base}/v1beta/models/{name}:streamGenerateContent?alt=sse", {"x-goog-api-key": cfg.api_key}, payload):
                     piece = parse_gemini(line)
                     if piece:
+                        if not started and info is not None:
+                            info["model"] = name
                         started = True
+                        _good[(cfg.api_key, cfg.speed)] = name
                         yield piece
                 if started:
                     return
                 last = LLMError("The AI service returned an empty answer.")
+                break
             except LLMError as e:
-                if started or e.code not in (404, 429, 500, 503):
+                if started:
                     raise
+                if e.code == 400 and thinking and "thinking" in str(e).lower():
+                    _no_think.add(name)
+                    continue  # this model rejects the setting: retry without it
                 last = e
-        raise last
-    elif cfg.provider.startswith("OpenAI"):
+                if e.code not in RETRY_CODES:
+                    raise
+                break
+    raise last
+
+
+def stream_chat(cfg: LLM, system: str, messages: list[dict], info: dict | None = None) -> Iterator[str]:
+    """messages: [{'role': 'user'|'assistant', 'content': str}]. Yields text pieces as they arrive.
+    info['model'] is filled with the model that answered."""
+    if cfg.provider.startswith("Gemini"):
+        yield from _gemini_stream(cfg, system, messages, info)
+        return
+    if cfg.provider.startswith("OpenAI"):
         if not cfg.api_key or not cfg.base_url:
             raise LLMError("Add the API key and address for your provider in the sidebar.")
         url = f"{cfg.base_url.rstrip('/')}/chat/completions"
@@ -171,6 +209,8 @@ def stream_chat(cfg: LLM, system: str, messages: list[dict]) -> Iterator[str]:
         parse, headers = parse_ollama, {}
     else:
         raise LLMError("No AI model selected.")
+    if info is not None:
+        info["model"] = cfg.model
     got = False
     for line in _lines(url, headers, payload):
         piece = parse(line)
